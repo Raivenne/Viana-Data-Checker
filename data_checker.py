@@ -1,6 +1,6 @@
 """
 Viana Portal - Daily Data Checker
-Checks all sites/zones for missing data and saves a report.
+Checks all sites/zones for missing data and saves a report + updates Google Sheets.
 
 HOW TO USE:
 1. Run this script
@@ -23,6 +23,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
+from sheets_logger import SheetsLogger
+
 if os.name == "nt":
     sys.stdout.reconfigure(encoding="utf-8")
     os.system("chcp 65001 > nul")
@@ -40,9 +42,13 @@ class VianaDataChecker:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1920,1080")
-        self.driver = webdriver.Chrome(options=opts)
-        self.wait   = WebDriverWait(self.driver, 20)
+        self.driver  = webdriver.Chrome(options=opts)
+        self.wait    = WebDriverWait(self.driver, 20)
         self.no_data_locations = []
+
+        print("  📊 Connecting to Google Sheets …")
+        self.sheets  = SheetsLogger()
+        print("  ✅ Google Sheets connected")
 
     # ════════════════════════════════════════════════════════════════════════
     # IFRAME
@@ -138,8 +144,6 @@ class VianaDataChecker:
         return next((c for c in containers if c.is_displayed()), None)
 
     def _collect_all_options(self):
-        """Scroll the virtual list top-to-bottom and return every unique option text."""
-        # Wait for first options
         for _ in range(15):
             if any(o.is_displayed() and o.text.strip() for o in
                    self.driver.find_elements(By.CSS_SELECTOR, ".ant-select-item-option-content")):
@@ -175,7 +179,6 @@ class VianaDataChecker:
             else:
                 stale_passes += 1
 
-        # Scroll back to top so subsequent clicks work
         if container:
             self.driver.execute_script("arguments[0].scrollTop = 0;", container)
             time.sleep(0.2)
@@ -183,10 +186,6 @@ class VianaDataChecker:
         return ordered
 
     def _scroll_and_click(self, target: str):
-        """
-        Scroll through the virtual list to find and click `target`.
-        Returns matched text or None.
-        """
         container = self._get_scroll_container()
         if container:
             self.driver.execute_script("arguments[0].scrollTop = 0;", container)
@@ -295,14 +294,10 @@ class VianaDataChecker:
             return True
 
     # ════════════════════════════════════════════════════════════════════════
-    # SELECT SITE  (shared helper — used by both discovery and processing)
+    # SELECT SITE
     # ════════════════════════════════════════════════════════════════════════
 
     def _select_site(self, site_name: str):
-        """
-        Clear all, select exactly one site, verify. Returns True on success.
-        Must be called INSIDE the iframe.
-        """
         self._click_clear_all()
         time.sleep(0.5)
 
@@ -315,7 +310,6 @@ class VianaDataChecker:
         chosen = self._scroll_and_click(site_name)
 
         if not chosen:
-            # Retry once
             print(f"  ⚠️  Site '{site_name}' not found — retrying …")
             time.sleep(2)
             self._open_dropdown(dd_site)
@@ -324,10 +318,9 @@ class VianaDataChecker:
                 print("  ❌ Could not select site — skipping")
                 return False
 
-        # Ensure only one site tag
         tags = self._get_selected_tags(dd_site)
         if len(tags) > 1:
-            print(f"  ⚠️  Multiple sites selected — fixing …")
+            print("  ⚠️  Multiple sites selected — fixing …")
             self._deselect_all_in_dropdown(dd_site)
             time.sleep(0.5)
             self._open_dropdown(dd_site)
@@ -337,9 +330,73 @@ class VianaDataChecker:
         return True
 
     # ════════════════════════════════════════════════════════════════════════
+    # PROCESS ONE SITE + ZONE
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _process_site_zone(self, site_name: str, zone_name: str):
+        print(f"\n  🔄 {site_name}  |  {zone_name}")
+        self._enter_iframe()
+
+        if not self._select_site(site_name):
+            self.driver.switch_to.default_content()
+            return None
+
+        print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones …")
+        time.sleep(self.ZONE_LOAD)
+
+        dd_zone = self._get_dropdown_by_label("Zones")
+        if dd_zone is None:
+            print("  ❌ Zones dropdown not found")
+            self.driver.switch_to.default_content()
+            return None
+
+        self._open_dropdown(dd_zone)
+        chosen_zone = self._scroll_and_click(zone_name)
+
+        if not chosen_zone:
+            print(f"  ⚠️  Zone '{zone_name}' not found — skipping")
+            self.driver.switch_to.default_content()
+            return None
+
+        tags = self._get_selected_tags(dd_zone)
+        if len(tags) > 1:
+            print("  ⚠️  Multiple zones — fixing …")
+            self._deselect_all_in_dropdown(dd_zone)
+            time.sleep(0.5)
+            self._open_dropdown(dd_zone)
+            self._scroll_and_click(zone_name)
+
+        print(f"  ✔ Zone       : {chosen_zone}")
+
+        dd_date = self._get_dropdown_by_label("Date and Time")
+        if dd_date is None:
+            print("  ❌ Date and Time dropdown not found")
+            self.driver.switch_to.default_content()
+            return None
+
+        self._open_dropdown(dd_date)
+        chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
+        print(f"  ✔ Date       : {chosen_date}")
+
+        self._click_apply_filters()
+
+        has_data = self._has_data()
+        if has_data:
+            print("  📊 ✓ HAS DATA")
+        else:
+            print("  🚨 ❌ NO DATA")
+            self.no_data_locations.append({
+                "site":      site_name,
+                "zone":      zone_name,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        self.driver.switch_to.default_content()
+        time.sleep(2)
+        return has_data
+
+    # ════════════════════════════════════════════════════════════════════════
     # MAIN AUTOMATION LOOP
-    # Single pass: for each site → select it → read zones → process each zone
-    # Never leaves the iframe between zone-fetch and zone-use.
     # ════════════════════════════════════════════════════════════════════════
 
     def run_full_automation(self):
@@ -371,18 +428,16 @@ class VianaDataChecker:
             print(f"🌐 SITE {i+1}/{len(sites)}: {site}")
             print("="*65)
 
-            # Enter iframe and select this site
+            # Select site and read its zones
             self._enter_iframe()
             ok = self._select_site(site)
             if not ok:
                 self.driver.switch_to.default_content()
                 continue
 
-            # Wait for zones to populate for THIS site
             print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones to load …")
             time.sleep(self.ZONE_LOAD)
 
-            # Read the zone list (still inside iframe, site already selected)
             dd_zone = self._get_dropdown_by_label("Zones")
             if dd_zone is None:
                 print("  ❌ Zones dropdown not found")
@@ -392,92 +447,28 @@ class VianaDataChecker:
             self._open_dropdown(dd_zone)
             zones = self._collect_all_options()
             self._close_dropdown()
+            self.driver.switch_to.default_content()
 
             print(f"  📍 {len(zones)} zone(s) found")
-
-            # Exit iframe between zones — each process_site_zone re-enters cleanly
-            self.driver.switch_to.default_content()
 
             if not zones:
                 print(f"  ⚠️  No zones for '{site}'")
                 continue
 
-            # ── Process each zone for this site ───────────────────────────
+            # ── Check each zone ───────────────────────────────────────────
+            site_results = []
             for zone in zones:
-                self._process_site_zone(site, zone)
+                result = self._process_site_zone(site, zone)
+                site_results.append((zone, result))
                 time.sleep(1)
 
-    # ════════════════════════════════════════════════════════════════════════
-    # PROCESS ONE SITE + ZONE
-    # ════════════════════════════════════════════════════════════════════════
-
-    def _process_site_zone(self, site_name: str, zone_name: str):
-        print(f"\n  🔄 {site_name}  |  {zone_name}")
-        self._enter_iframe()
-
-        # ── 1. Select site ────────────────────────────────────────────────
-        if not self._select_site(site_name):
-            self.driver.switch_to.default_content()
-            return None
-
-        # ── 2. Wait for zones ─────────────────────────────────────────────
-        print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones …")
-        time.sleep(self.ZONE_LOAD)
-
-        # ── 3. Select zone ────────────────────────────────────────────────
-        dd_zone = self._get_dropdown_by_label("Zones")
-        if dd_zone is None:
-            print("  ❌ Zones dropdown not found")
-            self.driver.switch_to.default_content()
-            return None
-
-        self._open_dropdown(dd_zone)
-        chosen_zone = self._scroll_and_click(zone_name)
-
-        if not chosen_zone:
-            print(f"  ⚠️  Zone '{zone_name}' not found — skipping")
-            self.driver.switch_to.default_content()
-            return None
-
-        tags = self._get_selected_tags(dd_zone)
-        if len(tags) > 1:
-            print("  ⚠️  Multiple zones — fixing …")
-            self._deselect_all_in_dropdown(dd_zone)
-            time.sleep(0.5)
-            self._open_dropdown(dd_zone)
-            self._scroll_and_click(zone_name)
-
-        print(f"  ✔ Zone       : {chosen_zone}")
-
-        # ── 4. Date and Time ──────────────────────────────────────────────
-        dd_date = self._get_dropdown_by_label("Date and Time")
-        if dd_date is None:
-            print("  ❌ Date and Time dropdown not found")
-            self.driver.switch_to.default_content()
-            return None
-
-        self._open_dropdown(dd_date)
-        chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
-        print(f"  ✔ Date       : {chosen_date}")
-
-        # ── 5. Apply Filters ──────────────────────────────────────────────
-        self._click_apply_filters()
-
-        # ── 6. Check result ───────────────────────────────────────────────
-        has_data = self._has_data()
-        if has_data:
-            print("  📊 ✓ HAS DATA")
-        else:
-            print("  🚨 ❌ NO DATA")
-            self.no_data_locations.append({
-                "site":      site_name,
-                "zone":      zone_name,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
-
-        self.driver.switch_to.default_content()
-        time.sleep(2)
-        return has_data
+            # ── Update Google Sheet after ALL zones for this site ─────────
+            print(f"\n  📊 Updating Google Sheet for {site} …")
+            self.sheets.append_site_separator(site)
+            for zone, has_data in site_results:
+                if has_data is not None:   # None means zone was skipped
+                    self.sheets.append_result(site, zone, has_data)
+            print(f"  ✅ Sheet updated — {len([r for r in site_results if r[1] is not None])} rows written")
 
     # ════════════════════════════════════════════════════════════════════════
     # REPORT
