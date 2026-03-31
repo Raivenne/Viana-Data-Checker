@@ -33,6 +33,7 @@ class VianaDataChecker:
     DROPDOWN_WAIT = 2
     ZONE_LOAD     = 5
     FILTER_WAIT   = 8
+    DATA_WAIT     = 5
 
     def __init__(self):
         opts = Options()
@@ -43,7 +44,9 @@ class VianaDataChecker:
         self.wait   = WebDriverWait(self.driver, 20)
         self.no_data_locations = []
 
-    # ── iframe ───────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # IFRAME
+    # ════════════════════════════════════════════════════════════════════════
 
     def _enter_iframe(self):
         self.driver.switch_to.default_content()
@@ -52,13 +55,49 @@ class VianaDataChecker:
         ))
         time.sleep(1)
 
-    # ── find dropdown selector by h4 label ───────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # CLEAR ALL
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _click_clear_all(self):
+        for sel in [
+            (By.CSS_SELECTOR, "button.filter-clear-all-button"),
+            (By.XPATH, "//button[.//span[contains(text(),'CLEAR ALL') or contains(text(),'Clear all')]]"),
+        ]:
+            try:
+                btn = WebDriverWait(self.driver, 4).until(EC.element_to_be_clickable(sel))
+                ActionChains(self.driver).move_to_element(btn).click().perform()
+                time.sleep(1.5)
+                return True
+            except Exception:
+                pass
+        return False
+
+    # ════════════════════════════════════════════════════════════════════════
+    # DESELECT ALL TAGS IN ONE MULTI-SELECT
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _deselect_all_in_dropdown(self, selector_el):
+        for _ in range(50):
+            try:
+                parent = selector_el.find_element(
+                    By.XPATH, "./ancestor::div[contains(@class,'ant-select')][1]"
+                )
+                btns = [b for b in parent.find_elements(
+                    By.CSS_SELECTOR, ".ant-select-selection-item-remove"
+                ) if b.is_displayed()]
+                if not btns:
+                    break
+                ActionChains(self.driver).move_to_element(btns[0]).click().perform()
+                time.sleep(0.25)
+            except Exception:
+                break
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FIND DROPDOWN BY H4 LABEL
+    # ════════════════════════════════════════════════════════════════════════
 
     def _get_dropdown_by_label(self, h4_text: str):
-        """
-        Find the .ant-select-selector inside the form item whose <h4> matches.
-        e.g. h4_text = 'Site' | 'Zones' | 'Date and Time'
-        """
         xpath = (
             f"//div[contains(@class,'ant-form-item')]"
             f"[.//h4[normalize-space()='{h4_text}']]"
@@ -71,7 +110,9 @@ class VianaDataChecker:
         except Exception:
             return None
 
-    # ── open a dropdown (ActionChains required) ───────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # OPEN / CLOSE DROPDOWN
+    # ════════════════════════════════════════════════════════════════════════
 
     def _open_dropdown(self, selector_el):
         self.driver.execute_script(
@@ -81,146 +122,228 @@ class VianaDataChecker:
         ActionChains(self.driver).move_to_element(selector_el).click().perform()
         time.sleep(self.DROPDOWN_WAIT)
 
-    # ── close the open dropdown by clicking its label area (outside list) ────
-
-    def _close_dropdown(self, selector_el):
-        """
-        Click the label h4 above the dropdown to dismiss the open list,
-        or fall back to Escape.
-        """
-        try:
-            # Click somewhere neutral — the form item label
-            ActionChains(self.driver).move_to_element(selector_el) \
-                .move_by_offset(0, -40).click().perform()
-        except Exception:
-            pass
+    def _close_dropdown(self):
         try:
             self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
         time.sleep(0.5)
 
-    # ── read options from the currently open dropdown ─────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # VIRTUAL LIST HELPERS
+    # ════════════════════════════════════════════════════════════════════════
 
-    def _get_open_options(self):
-        """
-        Return (texts, elements). Works for both multi and single select.
-        Uses .ant-select-item-option-content which holds the visible label text.
-        """
+    def _get_scroll_container(self):
+        containers = self.driver.find_elements(By.CSS_SELECTOR, ".rc-virtual-list-holder")
+        return next((c for c in containers if c.is_displayed()), None)
+
+    def _collect_all_options(self):
+        """Scroll the virtual list top-to-bottom and return every unique option text."""
+        # Wait for first options
         for _ in range(15):
-            opts = self.driver.find_elements(
-                By.CSS_SELECTOR,
-                ".ant-select-item-option-content"
-            )
-            visible = [o for o in opts if o.is_displayed() and o.text.strip()]
-            if visible:
-                return [o.text.strip() for o in visible], visible
+            if any(o.is_displayed() and o.text.strip() for o in
+                   self.driver.find_elements(By.CSS_SELECTOR, ".ant-select-item-option-content")):
+                break
             time.sleep(0.4)
-        return [], []
 
-    # ── click exactly one option ──────────────────────────────────────────────
+        container = self._get_scroll_container()
+        if container:
+            self.driver.execute_script("arguments[0].scrollTop = 0;", container)
+            time.sleep(0.2)
 
-    def _choose_one_option(self, target: str):
+        seen, ordered = set(), []
+        stale_passes = 0
+
+        while stale_passes < 2:
+            opts = [o for o in self.driver.find_elements(
+                By.CSS_SELECTOR, ".ant-select-item-option-content"
+            ) if o.is_displayed() and o.text.strip()]
+
+            new_found = False
+            for o in opts:
+                txt = o.text.strip()
+                if txt not in seen:
+                    seen.add(txt)
+                    ordered.append(txt)
+                    new_found = True
+
+            stale_passes = 0 if new_found else stale_passes + 1
+
+            if container:
+                self.driver.execute_script("arguments[0].scrollTop += 200;", container)
+                time.sleep(0.3)
+            else:
+                stale_passes += 1
+
+        # Scroll back to top so subsequent clicks work
+        if container:
+            self.driver.execute_script("arguments[0].scrollTop = 0;", container)
+            time.sleep(0.2)
+
+        return ordered
+
+    def _scroll_and_click(self, target: str):
         """
-        Click the option whose text exactly matches target.
-        Falls back to contains-match if exact not found.
+        Scroll through the virtual list to find and click `target`.
         Returns matched text or None.
         """
-        texts, els = self._get_open_options()
+        container = self._get_scroll_container()
+        if container:
+            self.driver.execute_script("arguments[0].scrollTop = 0;", container)
+            time.sleep(0.2)
 
-        # Try exact match first
-        for el, txt in zip(els, texts):
-            if txt == target:
-                ActionChains(self.driver).move_to_element(el).click().perform()
-                time.sleep(1.0)
-                return txt
+        target_lower = target.lower()
+        seen, stale_passes = set(), 0
 
-        # Fallback: contains match
-        for el, txt in zip(els, texts):
-            if target.lower() in txt.lower():
-                ActionChains(self.driver).move_to_element(el).click().perform()
-                time.sleep(1.0)
-                return txt
+        while stale_passes < 2:
+            opts = [o for o in self.driver.find_elements(
+                By.CSS_SELECTOR, ".ant-select-item-option-content"
+            ) if o.is_displayed() and o.text.strip()]
 
+            for o in opts:
+                txt = o.text.strip()
+                if txt == target or target_lower in txt.lower():
+                    ActionChains(self.driver).move_to_element(o).click().perform()
+                    time.sleep(0.8)
+                    self._close_dropdown()
+                    return txt
+
+            new_txts = {o.text.strip() for o in opts} - seen
+            seen |= new_txts
+            stale_passes = 0 if new_txts else stale_passes + 1
+
+            if container:
+                self.driver.execute_script("arguments[0].scrollTop += 200;", container)
+                time.sleep(0.3)
+            else:
+                stale_passes += 1
+
+        self._close_dropdown()
         return None
 
     def _choose_first_option(self):
-        _, els = self._get_open_options()
-        if els:
-            txt = els[0].text.strip()
-            ActionChains(self.driver).move_to_element(els[0]).click().perform()
-            time.sleep(1.0)
+        opts = [o for o in self.driver.find_elements(
+            By.CSS_SELECTOR, ".ant-select-item-option-content"
+        ) if o.is_displayed() and o.text.strip()]
+        if opts:
+            txt = opts[0].text.strip()
+            ActionChains(self.driver).move_to_element(opts[0]).click().perform()
+            time.sleep(0.8)
+            self._close_dropdown()
             return txt
         return None
 
-    # ── clear a multi-select dropdown before use ──────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # VERIFY SELECTED COUNT
+    # ════════════════════════════════════════════════════════════════════════
 
-    def _clear_dropdown(self, selector_el):
-        """
-        Click the × clear button on a multi-select dropdown if it exists.
-        Must hover the selector first to make the × visible.
-        """
+    def _get_selected_tags(self, selector_el):
         try:
-            # Hover to reveal the clear button
-            ActionChains(self.driver).move_to_element(selector_el).perform()
-            time.sleep(0.3)
-            # The clear button is a sibling span of the selector
             parent = selector_el.find_element(
                 By.XPATH, "./ancestor::div[contains(@class,'ant-select')][1]"
             )
-            clear_btn = parent.find_element(By.CSS_SELECTOR, ".ant-select-clear")
-            if clear_btn.is_displayed():
-                ActionChains(self.driver).move_to_element(clear_btn).click().perform()
-                time.sleep(0.5)
+            return [t.text.strip() for t in parent.find_elements(
+                By.CSS_SELECTOR, ".ant-select-selection-item-content"
+            ) if t.text.strip()]
         except Exception:
-            pass
+            return []
 
-    # ── Apply Filters button ──────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # APPLY FILTERS
+    # ════════════════════════════════════════════════════════════════════════
 
     def _click_apply_filters(self):
-        """
-        The HTML shows: <span>Apply filters</span> inside a button.
-        Find the button that contains that span.
-        """
-        xpaths = [
-            "//button[.//span[normalize-space()='Apply filters']]",
-            "//button[.//span[normalize-space()='Apply Filters']]",
-            "//button[normalize-space(.)='Apply filters']",
-            "//button[normalize-space(.)='Apply Filters']",
-            "//*[@data-test='apply-filters-btn']",
-        ]
-        for xp in xpaths:
+        for by, sel in [
+            (By.CSS_SELECTOR, "button.filter-apply-button"),
+            (By.XPATH, "//button[contains(@class,'filter-apply-button')]"),
+            (By.XPATH, "//button[.//span[normalize-space()='Apply filters']]"),
+            (By.XPATH, "//button[.//span[normalize-space()='APPLY FILTERS']]"),
+            (By.XPATH, "//*[@data-test='apply-filters-btn']"),
+        ]:
             try:
-                btn = WebDriverWait(self.driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, xp))
-                )
+                btn = WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable((by, sel)))
                 ActionChains(self.driver).move_to_element(btn).click().perform()
                 print("  ✅ Apply filters clicked")
                 time.sleep(self.FILTER_WAIT)
                 return True
             except Exception:
                 pass
-
-        # Debug: list all visible buttons
-        buttons = self.driver.find_elements(By.TAG_NAME, "button")
-        visible = [(b.text.strip(), b.get_attribute("class")) for b in buttons
+        buttons = [(b.text.strip(), b.get_attribute("class"))
+                   for b in self.driver.find_elements(By.TAG_NAME, "button")
                    if b.is_displayed() and b.text.strip()]
-        print(f"  ❌ Apply filters not found. Visible buttons: {visible[:8]}")
+        print(f"  ❌ Apply filters not found. Buttons: {buttons[:6]}")
         return False
 
-    # ── data check ────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # DATA CHECK
+    # ════════════════════════════════════════════════════════════════════════
 
     def _has_data(self):
-        NO_DATA = ["no data", "no data yet", "no results", "no records", "nothing to show"]
+        print(f"  ⏳ Waiting {self.DATA_WAIT}s for dashboard to load …")
+        time.sleep(self.DATA_WAIT)
+        NO_DATA = ["no data yet", "no data", "no results", "no records", "nothing to show"]
         try:
-            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
-            return not any(p in body for p in NO_DATA)
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "p.css-19zvg03"):
+                if el.is_displayed() and el.text.strip().lower() in NO_DATA:
+                    return False
+            if any(e.is_displayed() for e in self.driver.find_elements(By.CSS_SELECTOR, ".ant-empty")):
+                return False
+            if any(p in self.driver.find_element(By.TAG_NAME, "body").text.lower() for p in NO_DATA):
+                return False
+            return True
         except Exception:
             return True
 
-    # ── discover all sites ────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # SELECT SITE  (shared helper — used by both discovery and processing)
+    # ════════════════════════════════════════════════════════════════════════
 
-    def get_all_sites(self):
+    def _select_site(self, site_name: str):
+        """
+        Clear all, select exactly one site, verify. Returns True on success.
+        Must be called INSIDE the iframe.
+        """
+        self._click_clear_all()
+        time.sleep(0.5)
+
+        dd_site = self._get_dropdown_by_label("Site")
+        if dd_site is None:
+            print("  ❌ Site dropdown not found")
+            return False
+
+        self._open_dropdown(dd_site)
+        chosen = self._scroll_and_click(site_name)
+
+        if not chosen:
+            # Retry once
+            print(f"  ⚠️  Site '{site_name}' not found — retrying …")
+            time.sleep(2)
+            self._open_dropdown(dd_site)
+            chosen = self._scroll_and_click(site_name)
+            if not chosen:
+                print("  ❌ Could not select site — skipping")
+                return False
+
+        # Ensure only one site tag
+        tags = self._get_selected_tags(dd_site)
+        if len(tags) > 1:
+            print(f"  ⚠️  Multiple sites selected — fixing …")
+            self._deselect_all_in_dropdown(dd_site)
+            time.sleep(0.5)
+            self._open_dropdown(dd_site)
+            self._scroll_and_click(site_name)
+
+        print(f"  ✔ Site       : {chosen}")
+        return True
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MAIN AUTOMATION LOOP
+    # Single pass: for each site → select it → read zones → process each zone
+    # Never leaves the iframe between zone-fetch and zone-use.
+    # ════════════════════════════════════════════════════════════════════════
+
+    def run_full_automation(self):
+        # ── Fetch site list ───────────────────────────────────────────────
         print("\n📋 Fetching site list …")
         self._enter_iframe()
 
@@ -228,114 +351,103 @@ class VianaDataChecker:
         if dd is None:
             print("  ❌ Site dropdown not found")
             self.driver.switch_to.default_content()
-            return []
+            return
 
-        self._clear_dropdown(dd)
         self._open_dropdown(dd)
-        texts, _ = self._get_open_options()
-
-        # Deduplicate, preserve order
-        seen, unique = set(), []
-        for t in texts:
-            if t not in seen:
-                seen.add(t)
-                unique.append(t)
-
-        self._close_dropdown(dd)
-        print(f"  Found {len(unique)} sites")
-        # Leave inside iframe — caller calls default_content()
-        return unique
-
-    # ── discover zones for one site ───────────────────────────────────────────
-
-    def get_zones_for_site(self, site_name):
-        self._enter_iframe()
-
-        # Clear + open Site dropdown
-        dd_site = self._get_dropdown_by_label("Site")
-        if dd_site is None:
-            self.driver.switch_to.default_content()
-            return []
-
-        self._clear_dropdown(dd_site)
-        self._open_dropdown(dd_site)
-        chosen = self._choose_one_option(site_name)
-        if not chosen:
-            print(f"  ⚠️  Site '{site_name}' not found")
-            self._close_dropdown(dd_site)
-            self.driver.switch_to.default_content()
-            return []
-
-        # Close Site dropdown before touching Zones
-        self._close_dropdown(dd_site)
-
-        print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones …")
-        time.sleep(self.ZONE_LOAD)
-
-        dd_zone = self._get_dropdown_by_label("Zones")
-        if dd_zone is None:
-            self.driver.switch_to.default_content()
-            return []
-
-        self._clear_dropdown(dd_zone)
-        self._open_dropdown(dd_zone)
-        texts, _ = self._get_open_options()
-        self._close_dropdown(dd_zone)
-
-        seen, unique = set(), []
-        for t in texts:
-            if t not in seen:
-                seen.add(t)
-                unique.append(t)
-
+        sites = self._collect_all_options()
+        self._close_dropdown()
         self.driver.switch_to.default_content()
-        return unique
 
-    # ── process one site + zone combination ───────────────────────────────────
+        if not sites:
+            print("  ❌ CRITICAL: No sites found.")
+            return
 
-    def process_site_zone(self, site_name, zone_name):
+        print(f"  Found {len(sites)} sites")
+        print(f"\n🌐 {len(sites)} site(s) to process")
+
+        # ── Process each site ─────────────────────────────────────────────
+        for i, site in enumerate(sites):
+            print(f"\n{'='*65}")
+            print(f"🌐 SITE {i+1}/{len(sites)}: {site}")
+            print("="*65)
+
+            # Enter iframe and select this site
+            self._enter_iframe()
+            ok = self._select_site(site)
+            if not ok:
+                self.driver.switch_to.default_content()
+                continue
+
+            # Wait for zones to populate for THIS site
+            print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones to load …")
+            time.sleep(self.ZONE_LOAD)
+
+            # Read the zone list (still inside iframe, site already selected)
+            dd_zone = self._get_dropdown_by_label("Zones")
+            if dd_zone is None:
+                print("  ❌ Zones dropdown not found")
+                self.driver.switch_to.default_content()
+                continue
+
+            self._open_dropdown(dd_zone)
+            zones = self._collect_all_options()
+            self._close_dropdown()
+
+            print(f"  📍 {len(zones)} zone(s) found")
+
+            # Exit iframe between zones — each process_site_zone re-enters cleanly
+            self.driver.switch_to.default_content()
+
+            if not zones:
+                print(f"  ⚠️  No zones for '{site}'")
+                continue
+
+            # ── Process each zone for this site ───────────────────────────
+            for zone in zones:
+                self._process_site_zone(site, zone)
+                time.sleep(1)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PROCESS ONE SITE + ZONE
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _process_site_zone(self, site_name: str, zone_name: str):
         print(f"\n  🔄 {site_name}  |  {zone_name}")
         self._enter_iframe()
 
-        # ── 1. Site ───────────────────────────────────────────────────────
-        dd_site = self._get_dropdown_by_label("Site")
-        if dd_site is None:
-            print("  ❌ Site dropdown not found")
+        # ── 1. Select site ────────────────────────────────────────────────
+        if not self._select_site(site_name):
             self.driver.switch_to.default_content()
             return None
 
-        self._clear_dropdown(dd_site)
-        self._open_dropdown(dd_site)
-        chosen_site = self._choose_one_option(site_name)
-        if not chosen_site:
-            print(f"  ⚠️  Could not select site '{site_name}'")
-            self._close_dropdown(dd_site)
-            self.driver.switch_to.default_content()
-            return None
-        print(f"  ✔ Site       : {chosen_site}")
-        self._close_dropdown(dd_site)  # ← close before next dropdown
-
-        # ── 2. Wait for zones to load ─────────────────────────────────────
+        # ── 2. Wait for zones ─────────────────────────────────────────────
         print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones …")
         time.sleep(self.ZONE_LOAD)
 
-        # ── 3. Zone ───────────────────────────────────────────────────────
+        # ── 3. Select zone ────────────────────────────────────────────────
         dd_zone = self._get_dropdown_by_label("Zones")
         if dd_zone is None:
             print("  ❌ Zones dropdown not found")
             self.driver.switch_to.default_content()
             return None
 
-        self._clear_dropdown(dd_zone)
         self._open_dropdown(dd_zone)
-        chosen_zone = self._choose_one_option(zone_name)
+        chosen_zone = self._scroll_and_click(zone_name)
+
         if not chosen_zone:
             print(f"  ⚠️  Zone '{zone_name}' not found — skipping")
-            self._close_dropdown(dd_zone)
             self.driver.switch_to.default_content()
             return None
+
+        tags = self._get_selected_tags(dd_zone)
+        if len(tags) > 1:
+            print("  ⚠️  Multiple zones — fixing …")
+            self._deselect_all_in_dropdown(dd_zone)
+            time.sleep(0.5)
+            self._open_dropdown(dd_zone)
+            self._scroll_and_click(zone_name)
+
         print(f"  ✔ Zone       : {chosen_zone}")
-        self._close_dropdown(dd_zone)  # ← close before next dropdown
 
         # ── 4. Date and Time ──────────────────────────────────────────────
         dd_date = self._get_dropdown_by_label("Date and Time")
@@ -345,11 +457,8 @@ class VianaDataChecker:
             return None
 
         self._open_dropdown(dd_date)
-        chosen_date = self._choose_one_option("Today")
-        if not chosen_date:
-            chosen_date = self._choose_first_option()
+        chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
         print(f"  ✔ Date       : {chosen_date}")
-        # Single-select closes itself on pick — no manual close needed
 
         # ── 5. Apply Filters ──────────────────────────────────────────────
         self._click_apply_filters()
@@ -370,34 +479,9 @@ class VianaDataChecker:
         time.sleep(2)
         return has_data
 
-    # ── full automation loop ──────────────────────────────────────────────────
-
-    def run_full_automation(self):
-        sites = self.get_all_sites()
-        self.driver.switch_to.default_content()
-
-        if not sites:
-            print("\n❌ CRITICAL: No sites found.")
-            return
-
-        print(f"\n🌐 {len(sites)} site(s) to process")
-
-        for i, site in enumerate(sites):
-            print(f"\n{'='*65}")
-            print(f"🌐 SITE {i+1}/{len(sites)}: {site}")
-            print("="*65)
-
-            zones = self.get_zones_for_site(site)
-            if not zones:
-                print(f"  ⚠️  No zones found for '{site}'")
-                continue
-
-            print(f"  📍 {len(zones)} zone(s)")
-            for zone in zones:
-                self.process_site_zone(site, zone)
-                time.sleep(1)
-
-    # ── save report ───────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # REPORT
+    # ════════════════════════════════════════════════════════════════════════
 
     def save_report(self):
         ts       = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -415,7 +499,9 @@ class VianaDataChecker:
                 f.write("All zones are reporting data.\n")
         print(f"\n💾 Report saved: {filename}")
 
-    # ── entry point ───────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # ENTRY POINT
+    # ════════════════════════════════════════════════════════════════════════
 
     def run(self):
         try:
