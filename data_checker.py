@@ -8,11 +8,18 @@ HOW TO USE:
 3. Switch to QIC network
 4. Go to X-Ray → Audience Measurement → click Explore
 5. Press ENTER in this terminal
+
+RESUME AFTER CRASH:
+If the script crashes mid-run, just run it again.
+It will automatically skip any sites that were already completed today,
+and continue from where it left off.
 """
 
 import sys
 import os
+import json
 import time
+import traceback
 from datetime import datetime
 
 from selenium import webdriver
@@ -28,6 +35,40 @@ from sheets_logger import SheetsLogger
 if os.name == "nt":
     sys.stdout.reconfigure(encoding="utf-8")
     os.system("chcp 65001 > nul")
+
+# ── Progress file — tracks completed sites for today's run ───────────────────
+PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "progress.json")
+
+
+def _load_progress():
+    """
+    Load today's progress file.
+    Returns a dict: { "date": "YYYY-MM-DD", "completed_sites": [...] }
+    If the file doesn't exist or is from a previous day, returns a fresh state.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                return data
+        except Exception:
+            pass
+    # Fresh start for today
+    return {"date": today, "completed_sites": []}
+
+
+def _save_progress(data: dict):
+    """Write progress to disk immediately after each site completes."""
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _clear_progress():
+    """Delete the progress file after a full successful run."""
+    if os.path.exists(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
 
 
 class VianaDataChecker:
@@ -47,7 +88,7 @@ class VianaDataChecker:
         self.no_data_locations = []
 
         print("  📊 Connecting to Google Sheets …")
-        self.sheets  = SheetsLogger()
+        self.sheets = SheetsLogger()
         print("  ✅ Google Sheets connected")
 
     # ════════════════════════════════════════════════════════════════════════
@@ -143,10 +184,23 @@ class VianaDataChecker:
         containers = self.driver.find_elements(By.CSS_SELECTOR, ".rc-virtual-list-holder")
         return next((c for c in containers if c.is_displayed()), None)
 
+    def _safe_text(self, element):
+        """Read element text, returning None if the element has gone stale."""
+        try:
+            return element.text.strip()
+        except Exception:
+            return None
+
     def _collect_all_options(self):
+        """
+        Scroll the virtual list and collect every unique option text.
+        Re-queries the DOM on every pass to avoid StaleElementReferenceException.
+        """
         for _ in range(15):
-            if any(o.is_displayed() and o.text.strip() for o in
-                   self.driver.find_elements(By.CSS_SELECTOR, ".ant-select-item-option-content")):
+            els = self.driver.find_elements(
+                By.CSS_SELECTOR, ".ant-select-item-option-content"
+            )
+            if any(self._safe_text(o) for o in els):
                 break
             time.sleep(0.4)
 
@@ -159,14 +213,13 @@ class VianaDataChecker:
         stale_passes = 0
 
         while stale_passes < 2:
-            opts = [o for o in self.driver.find_elements(
+            els = self.driver.find_elements(
                 By.CSS_SELECTOR, ".ant-select-item-option-content"
-            ) if o.is_displayed() and o.text.strip()]
-
+            )
             new_found = False
-            for o in opts:
-                txt = o.text.strip()
-                if txt not in seen:
+            for o in els:
+                txt = self._safe_text(o)
+                if txt and o.is_displayed() and txt not in seen:
                     seen.add(txt)
                     ordered.append(txt)
                     new_found = True
@@ -175,7 +228,7 @@ class VianaDataChecker:
 
             if container:
                 self.driver.execute_script("arguments[0].scrollTop += 200;", container)
-                time.sleep(0.3)
+                time.sleep(0.35)
             else:
                 stale_passes += 1
 
@@ -186,6 +239,10 @@ class VianaDataChecker:
         return ordered
 
     def _scroll_and_click(self, target: str):
+        """
+        Scroll through the virtual list to find and click `target`.
+        Re-queries the DOM on every pass to avoid StaleElementReferenceException.
+        """
         container = self._get_scroll_container()
         if container:
             self.driver.execute_script("arguments[0].scrollTop = 0;", container)
@@ -195,25 +252,33 @@ class VianaDataChecker:
         seen, stale_passes = set(), 0
 
         while stale_passes < 2:
-            opts = [o for o in self.driver.find_elements(
+            els = self.driver.find_elements(
                 By.CSS_SELECTOR, ".ant-select-item-option-content"
-            ) if o.is_displayed() and o.text.strip()]
-
-            for o in opts:
-                txt = o.text.strip()
+            )
+            new_txts = set()
+            for o in els:
+                txt = self._safe_text(o)
+                if not txt:
+                    continue
+                new_txts.add(txt)
+                if not o.is_displayed():
+                    continue
                 if txt == target or target_lower in txt.lower():
-                    ActionChains(self.driver).move_to_element(o).click().perform()
-                    time.sleep(0.8)
-                    self._close_dropdown()
-                    return txt
+                    try:
+                        ActionChains(self.driver).move_to_element(o).click().perform()
+                        time.sleep(0.8)
+                        self._close_dropdown()
+                        return txt
+                    except Exception:
+                        break  # element went stale on click — re-scroll and retry
 
-            new_txts = {o.text.strip() for o in opts} - seen
+            added = new_txts - seen
             seen |= new_txts
-            stale_passes = 0 if new_txts else stale_passes + 1
+            stale_passes = 0 if added else stale_passes + 1
 
             if container:
                 self.driver.execute_script("arguments[0].scrollTop += 200;", container)
-                time.sleep(0.3)
+                time.sleep(0.35)
             else:
                 stale_passes += 1
 
@@ -221,15 +286,19 @@ class VianaDataChecker:
         return None
 
     def _choose_first_option(self):
-        opts = [o for o in self.driver.find_elements(
+        els = self.driver.find_elements(
             By.CSS_SELECTOR, ".ant-select-item-option-content"
-        ) if o.is_displayed() and o.text.strip()]
-        if opts:
-            txt = opts[0].text.strip()
-            ActionChains(self.driver).move_to_element(opts[0]).click().perform()
-            time.sleep(0.8)
-            self._close_dropdown()
-            return txt
+        )
+        for o in els:
+            txt = self._safe_text(o)
+            if txt and o.is_displayed():
+                try:
+                    ActionChains(self.driver).move_to_element(o).click().perform()
+                    time.sleep(0.8)
+                    self._close_dropdown()
+                    return txt
+                except Exception:
+                    continue
         return None
 
     # ════════════════════════════════════════════════════════════════════════
@@ -400,6 +469,15 @@ class VianaDataChecker:
     # ════════════════════════════════════════════════════════════════════════
 
     def run_full_automation(self):
+        # ── Load today's progress ─────────────────────────────────────────
+        progress = _load_progress()
+        completed_sites = set(progress["completed_sites"])
+
+        if completed_sites:
+            print(f"\n  ⏭️  Resuming — {len(completed_sites)} site(s) already done today:")
+            for s in completed_sites:
+                print(f"     ✓ {s}")
+
         # ── Fetch site list ───────────────────────────────────────────────
         print("\n📋 Fetching site list …")
         self._enter_iframe()
@@ -420,12 +498,15 @@ class VianaDataChecker:
             return
 
         print(f"  Found {len(sites)} sites")
-        print(f"\n🌐 {len(sites)} site(s) to process")
 
-        # ── Process each site ─────────────────────────────────────────────
-        for i, site in enumerate(sites):
+        # Filter out already-completed sites
+        remaining = [s for s in sites if s not in completed_sites]
+        print(f"\n🌐 {len(remaining)}/{len(sites)} site(s) remaining to process")
+
+        # ── Process each remaining site ───────────────────────────────────
+        for i, site in enumerate(remaining):
             print(f"\n{'='*65}")
-            print(f"🌐 SITE {i+1}/{len(sites)}: {site}")
+            print(f"🌐 SITE {sites.index(site)+1}/{len(sites)}: {site}")
             print("="*65)
 
             # Select site and read its zones
@@ -462,13 +543,26 @@ class VianaDataChecker:
                 site_results.append((zone, result))
                 time.sleep(1)
 
-            # ── Update Google Sheet after ALL zones for this site ─────────
+            # ── Update Google Sheet ───────────────────────────────────────
             print(f"\n  📊 Updating Google Sheet for {site} …")
-            self.sheets.append_site_separator(site)
-            for zone, has_data in site_results:
-                if has_data is not None:   # None means zone was skipped
-                    self.sheets.append_result(site, zone, has_data)
-            print(f"  ✅ Sheet updated — {len([r for r in site_results if r[1] is not None])} rows written")
+            try:
+                self.sheets.append_site_separator(site)
+                for zone, has_data in site_results:
+                    if has_data is not None:
+                        self.sheets.append_result(site, zone, has_data)
+                written = len([r for r in site_results if r[1] is not None])
+                print(f"  ✅ Sheet updated — {written} rows written")
+            except Exception as sheet_err:
+                print(f"  ⚠️  Sheet update failed (run continues): {sheet_err}")
+
+            # ── Mark site as done and save progress immediately ───────────
+            progress["completed_sites"].append(site)
+            _save_progress(progress)
+            print(f"  💾 Progress saved — '{site}' marked complete")
+
+        # ── Full run finished — clean up progress file ────────────────────
+        _clear_progress()
+        print("\n✅ All sites processed — progress file cleared")
 
     # ════════════════════════════════════════════════════════════════════════
     # REPORT
@@ -513,7 +607,17 @@ class VianaDataChecker:
             self.save_report()
 
         except KeyboardInterrupt:
-            print("\n⏹️  Cancelled by user")
+            print("\n⏹️  Cancelled by user — progress saved, run again to resume")
+            self.save_report()
+        except Exception:
+            print("\n" + "!"*65)
+            print("  💥 UNEXPECTED CRASH — full error below:")
+            print("!"*65)
+            traceback.print_exc()
+            print("!"*65)
+            print("  Progress saved up to last completed site.")
+            print("  Run the script again to resume from where it stopped.")
+            self.save_report()
         finally:
             self.driver.switch_to.default_content()
             input("\nPress ENTER to close the browser … ")
