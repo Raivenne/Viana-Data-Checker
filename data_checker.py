@@ -402,23 +402,24 @@ class VianaDataChecker:
     # PROCESS ONE ZONE  (site is already selected — do NOT reselect it)
     # ════════════════════════════════════════════════════════════════════════
 
-    def _process_zone(self, site_name: str, zone_name: str) -> bool | None:
+    def _process_zone(self, site_name: str, zone_name: str,
+                      date_already_set: bool = False) -> bool | None:
         self._enter_iframe()
         """
         Check one zone. The site MUST already be selected before calling this.
-        We only swap the Zone dropdown and re-apply filters.
+        Pass date_already_set=True for every zone after the first so the
+        Date and Time dropdown is left untouched — it stays on "Today".
         Returns True (has data), False (no data), or None (skipped).
         """
         print(f"\n  🔄 {zone_name}")
 
-        # ── Clear zone selection only (not site) ──────────────────────────
+        # ── Swap zone only (do NOT touch site) ───────────────────────────
         dd_zone = self._get_dropdown_by_label("Zones")
         if dd_zone is None:
             print("  ❌ Zones dropdown not found")
             return None
 
         self._deselect_all_in_dropdown(dd_zone)
-
         self._open_dropdown(dd_zone)
         chosen_zone = self._scroll_and_click(zone_name)
 
@@ -437,16 +438,17 @@ class VianaDataChecker:
 
         print(f"  ✔ Zone       : {chosen_zone}")
 
-        # ── Date (only set it once per site — check if already set) ──────
-        dd_date = self._get_dropdown_by_label("Date and Time")
-        if dd_date is None:
-            print("  ❌ Date and Time dropdown not found")
-            return None
-
-        # Re-set date every zone to be safe (it's a fast single-select)
-        self._open_dropdown(dd_date)
-        chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
-        print(f"  ✔ Date       : {chosen_date}")
+        # ── Date — set only on the first zone, leave untouched after ─────
+        if not date_already_set:
+            dd_date = self._get_dropdown_by_label("Date and Time")
+            if dd_date is None:
+                print("  ❌ Date and Time dropdown not found")
+                return None
+            self._open_dropdown(dd_date)
+            chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
+            print(f"  ✔ Date       : {chosen_date} (set once — stays for all zones)")
+        else:
+            print("  ✔ Date       : Today (unchanged)")
 
         # ── Apply & check ─────────────────────────────────────────────────
         self._click_apply_filters()
@@ -536,13 +538,13 @@ class VianaDataChecker:
                 print(f"  ⚠️  No zones for '{site}'")
                 continue
 
-            # ── Check each zone (site stays selected throughout) ──────────
+            # ── Check each zone (site + date stay selected throughout) ──
             print(f"\n  ✔ Site       : {site}")
             site_results = []
-            for zone in zones:
-                result = self._process_zone(site, zone)
+            for z_idx, zone in enumerate(zones):
+                # date_already_set=True for every zone after the first
+                result = self._process_zone(site, zone, date_already_set=(z_idx > 0))
                 site_results.append((zone, result))
-                # Queue result immediately so partial progress isn't lost
                 if result is not None:
                     self.sheets.queue_result(site, zone, result)
                 time.sleep(0.5)
