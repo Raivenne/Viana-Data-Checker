@@ -399,32 +399,32 @@ class VianaDataChecker:
         return True
 
     # ════════════════════════════════════════════════════════════════════════
-    # PROCESS ONE SITE + ZONE
+    # PROCESS ONE ZONE  (site is already selected — do NOT reselect it)
     # ════════════════════════════════════════════════════════════════════════
 
-    def _process_site_zone(self, site_name: str, zone_name: str):
-        print(f"\n  🔄 {site_name}  |  {zone_name}")
+    def _process_zone(self, site_name: str, zone_name: str) -> bool | None:
         self._enter_iframe()
+        """
+        Check one zone. The site MUST already be selected before calling this.
+        We only swap the Zone dropdown and re-apply filters.
+        Returns True (has data), False (no data), or None (skipped).
+        """
+        print(f"\n  🔄 {zone_name}")
 
-        if not self._select_site(site_name):
-            self.driver.switch_to.default_content()
-            return None
-
-        print(f"  ⏳ Waiting {self.ZONE_LOAD}s for zones …")
-        time.sleep(self.ZONE_LOAD)
-
+        # ── Clear zone selection only (not site) ──────────────────────────
         dd_zone = self._get_dropdown_by_label("Zones")
         if dd_zone is None:
             print("  ❌ Zones dropdown not found")
-            self.driver.switch_to.default_content()
             return None
+
+        self._deselect_all_in_dropdown(dd_zone)
 
         self._open_dropdown(dd_zone)
         chosen_zone = self._scroll_and_click(zone_name)
 
         if not chosen_zone:
             print(f"  ⚠️  Zone '{zone_name}' not found — skipping")
-            self.driver.switch_to.default_content()
+            self._close_dropdown()
             return None
 
         tags = self._get_selected_tags(dd_zone)
@@ -437,19 +437,21 @@ class VianaDataChecker:
 
         print(f"  ✔ Zone       : {chosen_zone}")
 
+        # ── Date (only set it once per site — check if already set) ──────
         dd_date = self._get_dropdown_by_label("Date and Time")
         if dd_date is None:
             print("  ❌ Date and Time dropdown not found")
-            self.driver.switch_to.default_content()
             return None
 
+        # Re-set date every zone to be safe (it's a fast single-select)
         self._open_dropdown(dd_date)
         chosen_date = self._scroll_and_click("Today") or self._choose_first_option()
         print(f"  ✔ Date       : {chosen_date}")
 
+        # ── Apply & check ─────────────────────────────────────────────────
         self._click_apply_filters()
-
         has_data = self._has_data()
+
         if has_data:
             print("  📊 ✓ HAS DATA")
         else:
@@ -460,8 +462,6 @@ class VianaDataChecker:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
 
-        self.driver.switch_to.default_content()
-        time.sleep(2)
         return has_data
 
     # ════════════════════════════════════════════════════════════════════════
@@ -536,20 +536,21 @@ class VianaDataChecker:
                 print(f"  ⚠️  No zones for '{site}'")
                 continue
 
-            # ── Check each zone ───────────────────────────────────────────
+            # ── Check each zone (site stays selected throughout) ──────────
+            print(f"\n  ✔ Site       : {site}")
             site_results = []
             for zone in zones:
-                result = self._process_site_zone(site, zone)
+                result = self._process_zone(site, zone)
                 site_results.append((zone, result))
-                time.sleep(1)
+                # Queue result immediately so partial progress isn't lost
+                if result is not None:
+                    self.sheets.queue_result(site, zone, result)
+                time.sleep(0.5)
 
-            # ── Update Google Sheet ───────────────────────────────────────
+            # ── Flush all results for this site to Sheets in one batch ────
             print(f"\n  📊 Updating Google Sheet for {site} …")
             try:
-                self.sheets.append_site_separator(site)
-                for zone, has_data in site_results:
-                    if has_data is not None:
-                        self.sheets.append_result(site, zone, has_data)
+                self.sheets.flush_site()
                 written = len([r for r in site_results if r[1] is not None])
                 print(f"  ✅ Sheet updated — {written} rows written")
             except Exception as sheet_err:
