@@ -74,8 +74,8 @@ def _clear_progress():
 class VianaDataChecker:
 
     DROPDOWN_WAIT = 2
-    ZONE_LOAD     = 5
-    FILTER_WAIT   = 8
+    ZONE_LOAD     = 10
+    FILTER_WAIT   = 10
     DATA_WAIT     = 5
 
     def __init__(self):
@@ -404,7 +404,6 @@ class VianaDataChecker:
 
     def _process_zone(self, site_name: str, zone_name: str,
                       date_already_set: bool = False) -> bool | None:
-        self._enter_iframe()
         """
         Check one zone. The site MUST already be selected before calling this.
         Pass date_already_set=True for every zone after the first so the
@@ -453,6 +452,9 @@ class VianaDataChecker:
         # ── Apply & check ─────────────────────────────────────────────────
         self._click_apply_filters()
         has_data = self._has_data()
+
+        # Always exit iframe before returning so the next call starts clean
+        self.driver.switch_to.default_content()
 
         if has_data:
             print("  📊 ✓ HAS DATA")
@@ -542,6 +544,8 @@ class VianaDataChecker:
             print(f"\n  ✔ Site       : {site}")
             site_results = []
             for z_idx, zone in enumerate(zones):
+                # Re-enter iframe for each zone (we exit after each _has_data check)
+                self._enter_iframe()
                 # date_already_set=True for every zone after the first
                 result = self._process_zone(site, zone, date_already_set=(z_idx > 0))
                 site_results.append((zone, result))
@@ -550,13 +554,16 @@ class VianaDataChecker:
                 time.sleep(0.5)
 
             # ── Flush all results for this site to Sheets in one batch ────
+            # Driver is now in default_content (exited after last zone)
             print(f"\n  📊 Updating Google Sheet for {site} …")
             try:
                 self.sheets.flush_site()
                 written = len([r for r in site_results if r[1] is not None])
                 print(f"  ✅ Sheet updated — {written} rows written")
             except Exception as sheet_err:
-                print(f"  ⚠️  Sheet update failed (run continues): {sheet_err}")
+                import traceback
+                print(f"  ⚠️  Sheet update failed (run continues):")
+                traceback.print_exc()
 
             # ── Mark site as done and save progress immediately ───────────
             progress["completed_sites"].append(site)
