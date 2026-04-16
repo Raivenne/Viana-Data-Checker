@@ -16,7 +16,6 @@ import os
 from datetime import datetime
 
 import gspread
-from gspread_formatting import CellFormat, Color, TextFormat, format_cell_range
 from google.oauth2.service_account import Credentials
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
@@ -26,24 +25,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
-# ── Cell formats ──────────────────────────────────────────────────────────────
-FMT_NO_DATA = CellFormat(
-    backgroundColor=Color(1, 0.8, 0.8),
-    textFormat=TextFormat(bold=True, foregroundColor=Color(0.6, 0, 0))
-)
-FMT_HAS_DATA = CellFormat(
-    backgroundColor=Color(0.85, 1, 0.85),
-    textFormat=TextFormat(bold=False, foregroundColor=Color(0, 0.4, 0))
-)
-FMT_HEADER = CellFormat(
-    backgroundColor=Color(0.2, 0.2, 0.2),
-    textFormat=TextFormat(bold=True, foregroundColor=Color(1, 1, 1))
-)
-FMT_DATE_HEADER = CellFormat(
-    backgroundColor=Color(0.3, 0.3, 0.6),
-    textFormat=TextFormat(bold=True, foregroundColor=Color(1, 1, 1))
-)
 
 
 def _col_letter(col_index: int) -> str:
@@ -55,11 +36,26 @@ def _col_letter(col_index: int) -> str:
     return result
 
 
+def _col_letter_to_index(col_str: str) -> int:
+    """Convert column letter(s) to 0-based index. A→0, B→1, AA→26, etc."""
+    idx = 0
+    for ch in col_str.upper():
+        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+    return idx - 1
+
+
+def _parse_cell(cell_addr: str):
+    """Parse 'C5' into (row_0based=4, col_0based=2)."""
+    col_str, row_str = "", ""
+    for ch in cell_addr:
+        if ch.isalpha():
+            col_str += ch
+        else:
+            row_str += ch
+    return int(row_str) - 1, _col_letter_to_index(col_str)
+
+
 def _retry(fn, retries=4, delay=15):
-    """
-    Call fn(), retrying up to `retries` times on any exception.
-    Waits `delay` seconds between attempts (handles 502 / rate-limit errors).
-    """
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -75,22 +71,84 @@ def _retry(fn, retries=4, delay=15):
 
 class SheetsLogger:
 
-    def __init__(self):
-        creds      = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-        client     = gspread.authorize(creds)
-        self.sheet = client.open_by_key(SHEET_ID).sheet1
+    # ── Colours (RGB 0-1 scale) ───────────────────────────────────────────────
+    _RED_BG   = {"red": 1.0,  "green": 0.8,  "blue": 0.8}   # light red
+    _RED_FG   = {"red": 0.6,  "green": 0.0,  "blue": 0.0}   # dark red
+    _WHITE_BG = {"red": 1.0,  "green": 1.0,  "blue": 1.0}   # white
+    _BLACK_FG = {"red": 0.0,  "green": 0.0,  "blue": 0.0}   # black
+    _DGREY_BG = {"red": 0.2,  "green": 0.2,  "blue": 0.2}   # dark grey (header)
+    _BLUE_BG  = {"red": 0.3,  "green": 0.3,  "blue": 0.6}   # blue (date header)
 
-        # Build today's date string without leading zero (works on Windows too)
+    def __init__(self):
+        creds           = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        self.client     = gspread.authorize(creds)
+        self.spreadsheet= self.client.open_by_key(SHEET_ID)
+        self.sheet      = self.spreadsheet.sheet1
+        self.sheet_id   = self.sheet.id
+
         now = datetime.now()
         self.today = f"{now.strftime('%B')} {now.day}, {now.year}"
 
         self._ensure_headers()
-        self.date_col = self._get_or_create_date_column(self.today)
+        self.date_col   = self._get_or_create_date_column(self.today)
         self._row_cache = self._build_row_cache()
-
-        # Buffer: list of (site, zone, has_data) accumulated per site
-        # Flushed in one batch call to minimise API round-trips
         self._pending: list[tuple[str, str, bool]] = []
+
+    # ── Low-level: single batchUpdate call ───────────────────────────────────
+
+    def _batch_update(self, requests: list):
+        """Send a batchUpdate with retry."""
+        _retry(lambda: self.spreadsheet.batch_update({"requests": requests}))
+
+    # ── Cell format helpers (all via raw API — no gspread_formatting) ─────────
+
+    def _fmt_request(self, row_0: int, col_0: int, bg: dict, fg: dict, bold: bool) -> dict:
+        """Build a single repeatCell format request."""
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId":          self.sheet_id,
+                    "startRowIndex":    row_0,
+                    "endRowIndex":      row_0 + 1,
+                    "startColumnIndex": col_0,
+                    "endColumnIndex":   col_0 + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": bg,
+                        "textFormat": {
+                            "foregroundColor": fg,
+                            "bold": bold,
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)"
+            }
+        }
+
+    def _note_request(self, row_0: int, col_0: int, note: str) -> dict:
+        """Build a single updateCells note request."""
+        return {
+            "updateCells": {
+                "rows": [{"values": [{"note": note}]}],
+                "fields": "note",
+                "range": {
+                    "sheetId":          self.sheet_id,
+                    "startRowIndex":    row_0,
+                    "endRowIndex":      row_0 + 1,
+                    "startColumnIndex": col_0,
+                    "endColumnIndex":   col_0 + 1,
+                }
+            }
+        }
+
+    def _header_fmt_request(self, row_0: int, col_0: int, bg: dict) -> dict:
+        """Bold white text on coloured background for headers."""
+        return self._fmt_request(
+            row_0, col_0, bg,
+            fg={"red": 1.0, "green": 1.0, "blue": 1.0},
+            bold=True
+        )
 
     # ── Header setup ──────────────────────────────────────────────────────────
 
@@ -99,7 +157,11 @@ class SheetsLogger:
         if len(row1) < 2 or row1[0] != "Site" or row1[1] != "Zone":
             _retry(lambda: self.sheet.clear())
             _retry(lambda: self.sheet.update("A1:B1", [["Site", "Zone"]]))
-            _retry(lambda: format_cell_range(self.sheet, "A1:B1", FMT_HEADER))
+        # Always re-apply header formatting
+        self._batch_update([
+            self._header_fmt_request(0, 0, self._DGREY_BG),
+            self._header_fmt_request(0, 1, self._DGREY_BG),
+        ])
 
     # ── Date column ───────────────────────────────────────────────────────────
 
@@ -111,7 +173,7 @@ class SheetsLogger:
         new_col    = len(row1) + 1
         col_letter = _col_letter(new_col)
         _retry(lambda: self.sheet.update(f"{col_letter}1", [[date_str]]))
-        _retry(lambda: format_cell_range(self.sheet, f"{col_letter}1", FMT_DATE_HEADER))
+        self._batch_update([self._header_fmt_request(0, new_col - 1, self._BLUE_BG)])
         return new_col
 
     # ── Row cache ─────────────────────────────────────────────────────────────
@@ -137,69 +199,64 @@ class SheetsLogger:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def queue_result(self, site: str, zone: str, has_data: bool):
-        """
-        Buffer one result. Call flush_site() after all zones for a site are done.
-        Nothing is written to Sheets until flush_site() is called.
-        """
         self._pending.append((site, zone, has_data))
 
     def flush_site(self):
         """
-        Write all buffered results to Sheets in as few API calls as possible,
-        then clear the buffer.
-
-        Strategy:
-          1. Ensure all Site+Zone rows exist (batch append if needed).
-          2. Build a single batch_update payload for all cell values.
-          3. Apply formatting in two bulk calls (one for No data, one for Has data).
+        Write all buffered results in as few API calls as possible:
+          1. Resolve / create row for each Site+Zone.
+          2. batch_update all cell values in one call.
+          3. One batchUpdate with all format + note requests combined.
         """
         if not self._pending:
             return
 
         col_letter = _col_letter(self.date_col)
+        col_0      = self.date_col - 1   # 0-based
 
-        # ── Step 1: resolve row indices (creates missing rows) ────────────
-        row_indices = []
-        for site, zone, _ in self._pending:
-            row_indices.append(self._get_or_create_row(site, zone))
+        # ── Step 1: resolve rows ──────────────────────────────────────────
+        row_indices = [self._get_or_create_row(s, z) for s, z, _ in self._pending]
 
-        # ── Step 2: batch-write all values in one API call ────────────────
-        cell_updates = []
+        # ── Step 2: write values (one batch call) ─────────────────────────
+        cell_updates = [
+            {
+                "range":  f"{col_letter}{row_idx}",
+                "values": [["Has data" if has_data else "No data"]]
+            }
+            for (_, __, has_data), row_idx in zip(self._pending, row_indices)
+        ]
+        _retry(lambda: self.sheet.batch_update(cell_updates, value_input_option="RAW"))
+
+        # ── Step 3: format + notes in ONE batchUpdate call ────────────────
+        requests = []
+        note_text = (
+            f"⚠️ No data detected on {self.today}.\n"
+            f"Please check this zone in the Viana Portal."
+        )
+
         for (site, zone, has_data), row_idx in zip(self._pending, row_indices):
-            output = "Has data" if has_data else "No data"
-            cell_updates.append({
-                "range": f"{col_letter}{row_idx}",
-                "values": [[output]]
-            })
+            row_0 = row_idx - 1   # 0-based
 
-        _retry(lambda: self.sheet.batch_update(
-            cell_updates, value_input_option="RAW"
-        ))
-
-        # ── Step 3: bulk-format — two calls total (no_data + has_data) ────
-        no_data_ranges  = []
-        has_data_ranges = []
-        for (_, __, has_data), row_idx in zip(self._pending, row_indices):
-            addr = f"{col_letter}{row_idx}"
             if has_data:
-                has_data_ranges.append(addr)
+                # Plain: white background, black text, not bold
+                requests.append(self._fmt_request(
+                    row_0, col_0, self._WHITE_BG, self._BLACK_FG, bold=False
+                ))
             else:
-                no_data_ranges.append(addr)
+                # Alert: light red background, dark red bold text
+                requests.append(self._fmt_request(
+                    row_0, col_0, self._RED_BG, self._RED_FG, bold=True
+                ))
+                # Note on the cell
+                requests.append(self._note_request(row_0, col_0, note_text))
 
-        if no_data_ranges:
-            combined = ",".join(no_data_ranges)
-            _retry(lambda: format_cell_range(self.sheet, combined, FMT_NO_DATA))
-
-        if has_data_ranges:
-            combined = ",".join(has_data_ranges)
-            _retry(lambda: format_cell_range(self.sheet, combined, FMT_HAS_DATA))
-
+        self._batch_update(requests)
         self._pending.clear()
 
     def append_result(self, site: str, zone: str, has_data: bool):
-        """Compatibility shim — just queues the result."""
+        """Compatibility shim."""
         self.queue_result(site, zone, has_data)
 
     def append_site_separator(self, site: str):
-        """No-op — not needed in matrix layout."""
+        """No-op."""
         pass
