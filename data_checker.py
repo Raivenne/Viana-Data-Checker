@@ -73,10 +73,10 @@ def _clear_progress():
 
 class VianaDataChecker:
 
-    DROPDOWN_WAIT = 2
-    ZONE_LOAD     = 10
-    FILTER_WAIT   = 10
-    DATA_WAIT     = 5
+    DROPDOWN_WAIT = 4
+    ZONE_LOAD     = 24
+    FILTER_WAIT   = 4
+    DATA_WAIT     = 6
 
     def __init__(self):
         opts = Options()
