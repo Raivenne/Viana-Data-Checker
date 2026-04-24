@@ -31,6 +31,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
 from sheets_logger import SheetsLogger
+from email_notifier import send_summary
 
 if os.name == "nt":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -73,10 +74,10 @@ def _clear_progress():
 
 class VianaDataChecker:
 
-    DROPDOWN_WAIT = 2
-    ZONE_LOAD     = 10
-    FILTER_WAIT   = 10
-    DATA_WAIT     = 5
+    DROPDOWN_WAIT = 4
+    ZONE_LOAD     = 24
+    FILTER_WAIT   = 4
+    DATA_WAIT     = 6
 
     def __init__(self):
         opts = Options()
@@ -86,6 +87,7 @@ class VianaDataChecker:
         self.driver  = webdriver.Chrome(options=opts)
         self.wait    = WebDriverWait(self.driver, 20)
         self.no_data_locations = []
+        self._total_zones_checked = 0
 
         print("  📊 Connecting to Google Sheets …")
         self.sheets = SheetsLogger()
@@ -548,6 +550,7 @@ class VianaDataChecker:
                 self._enter_iframe()
                 # date_already_set=True for every zone after the first
                 result = self._process_zone(site, zone, date_already_set=(z_idx > 0))
+                self._total_zones_checked += 1
                 site_results.append((zone, result))
                 if result is not None:
                     self.sheets.queue_result(site, zone, result)
@@ -615,10 +618,13 @@ class VianaDataChecker:
 
             self.run_full_automation()
             self.save_report()
+            send_summary(self.no_data_locations, self._total_zones_checked)
 
         except KeyboardInterrupt:
             print("\n⏹️  Cancelled by user — progress saved, run again to resume")
             self.save_report()
+            send_summary(self.no_data_locations, self._total_zones_checked)
+
         except Exception:
             print("\n" + "!"*65)
             print("  💥 UNEXPECTED CRASH — full error below:")
@@ -628,6 +634,8 @@ class VianaDataChecker:
             print("  Progress saved up to last completed site.")
             print("  Run the script again to resume from where it stopped.")
             self.save_report()
+            send_summary(self.no_data_locations, self._total_zones_checked)
+
         finally:
             self.driver.switch_to.default_content()
             input("\nPress ENTER to close the browser … ")
