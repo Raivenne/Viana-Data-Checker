@@ -550,6 +550,7 @@ class VianaDataChecker:
                 self._enter_iframe()
                 # date_already_set=True for every zone after the first
                 result = self._process_zone(site, zone, date_already_set=(z_idx > 0))
+                self._total_zones_checked += 1
                 site_results.append((zone, result))
                 if result is not None:
                     self.sheets.queue_result(site, zone, result)
@@ -623,6 +624,7 @@ class VianaDataChecker:
 
             self.run_full_automation()
             self.save_report()
+            send_summary(self.no_data_locations, self._total_zones_checked)
 
         except KeyboardInterrupt:
             print("\n⏹️  Cancelled by user — progress saved, run again to resume")
