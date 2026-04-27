@@ -74,10 +74,10 @@ def _clear_progress():
 
 class VianaDataChecker:
 
-    DROPDOWN_WAIT = 4
+    DROPDOWN_WAIT = 2
     ZONE_LOAD     = 24
-    FILTER_WAIT   = 4
-    DATA_WAIT     = 6
+    FILTER_WAIT   = 8
+    DATA_WAIT     = 5
 
     def __init__(self):
         opts = Options()
@@ -87,7 +87,7 @@ class VianaDataChecker:
         self.driver  = webdriver.Chrome(options=opts)
         self.wait    = WebDriverWait(self.driver, 20)
         self.no_data_locations = []
-        self._total_zones_checked = 0
+        self._total_zones_checked = 0 
 
         print("  📊 Connecting to Google Sheets …")
         self.sheets = SheetsLogger()
@@ -602,6 +602,8 @@ class VianaDataChecker:
     # ════════════════════════════════════════════════════════════════════════
 
     def run(self):
+        interactive = sys.stdin.isatty()
+
         try:
             self.driver.get("https://portal.viana.ai/")
             print("="*65)
@@ -613,7 +615,11 @@ class VianaDataChecker:
             print("  4. Wait for the page to FULLY load (3 dropdowns visible)")
             print("  5. Come back here and press ENTER")
             print("="*65)
-            input("\n  ▶  Press ENTER when ready … ")
+            if interactive:
+                input("\n  ▶  Press ENTER when ready … ")
+            else:
+                print("\n  ⏳ Non-interactive mode — waiting 60s for manual login …")
+                time.sleep(60)
             time.sleep(2)
 
             self.run_full_automation()
@@ -623,7 +629,6 @@ class VianaDataChecker:
         except KeyboardInterrupt:
             print("\n⏹️  Cancelled by user — progress saved, run again to resume")
             self.save_report()
-            send_summary(self.no_data_locations, self._total_zones_checked)
 
         except Exception:
             print("\n" + "!"*65)
@@ -634,9 +639,9 @@ class VianaDataChecker:
             print("  Progress saved up to last completed site.")
             print("  Run the script again to resume from where it stopped.")
             self.save_report()
-            send_summary(self.no_data_locations, self._total_zones_checked)
 
         finally:
+            send_summary(self.no_data_locations, self._total_zones_checked)
             self.driver.switch_to.default_content()
             input("\nPress ENTER to close the browser … ")
             self.driver.quit()
