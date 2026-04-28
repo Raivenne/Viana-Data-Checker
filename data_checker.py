@@ -57,7 +57,7 @@ def _load_progress():
         except Exception:
             pass
     # Fresh start for today
-    return {"date": today, "completed_sites": []}
+    return {"date": today, "completed_sites": [], "no_data_locations": []}
 
 
 def _save_progress(data: dict):
@@ -479,6 +479,10 @@ class VianaDataChecker:
         progress = _load_progress()
         completed_sites = set(progress["completed_sites"])
 
+        if progress.get("no_data_locations"):
+            self.no_data_locations = progress["no_data_locations"]
+            print(f"\n  ⚠️  Restored {len(self.no_data_locations)} no-data record(s) from previous run")
+
         if completed_sites:
             print(f"\n  ⏭️  Resuming — {len(completed_sites)} site(s) already done today:")
             for s in completed_sites:
@@ -570,6 +574,7 @@ class VianaDataChecker:
 
             # ── Mark site as done and save progress immediately ───────────
             progress["completed_sites"].append(site)
+            progress["no_data_locations"] = self.no_data_locations
             _save_progress(progress)
             print(f"  💾 Progress saved — '{site}' marked complete")
 
